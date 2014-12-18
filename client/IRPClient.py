@@ -260,7 +260,7 @@ class IRPClient(protocol.Protocol):
         self.protocolState = IRPClient.WAITING_HEARTBEAT
 
     def handleHeartbeat(self):
-        magic,  = struct.unpack("!B", self.msgData)
+        magic, = struct.unpack("!B", self.msgData)
         log.msg("Got heartbeat: %s" % magic)
 
         if magic != IRPClient.SERVER_HEARTBEAT_MAGIC:

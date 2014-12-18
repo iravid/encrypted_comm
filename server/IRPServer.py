@@ -1,5 +1,8 @@
+import os
 from Crypto.Util import number
+from twisted.mail.maildir import MaildirMailbox
 from twisted.python import log
+from server import Configuration
 
 __author__ = 'iravid'
 
@@ -321,8 +324,10 @@ class IRPServerFactory(protocol.ServerFactory):
     Server factory for client handlers.
 
     @ivar signatureKey: An RSA private key used for signing messages.
+    @ivar mailboxes: A dictionary of twisted.mail.maildir.MaildirMailbox objects indexed by username.
     """
     signatureKey = None
+    mailboxes = {}
 
     def __init__(self):
         from UserDatabase import _servPrivKey
@@ -330,6 +335,12 @@ class IRPServerFactory(protocol.ServerFactory):
 
     def buildProtocol(self, addr):
         return IRPServer(self)
+
+    def initializeMailboxes(self):
+        for username in UserDatabase.getUsers():
+            mailbox = MaildirMailbox(os.path.join(Configuration.MAILDIR_DIRECTORY, username))
+            self.mailboxes[username] = mailbox
+
 
 
 

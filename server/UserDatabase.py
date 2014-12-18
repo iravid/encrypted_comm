@@ -13,6 +13,9 @@ _servPubKey = '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBC
 def getByUserId(userId):
     return _database.get(userId, None)
 
+def getUsers():
+    return _database.keys()
+
 def addCertificate(cert):
     _database[cert.userId] = cert
 
@@ -33,6 +36,4 @@ def _initialize():
     _initialized = True
 
 _initialize()
-
-
 
