@@ -62,11 +62,10 @@ class IRPServer(protocol.Protocol):
     encryptionKey = b""
 
     # Signature keys
-    signatureKey = None
     clientSignatureKey = None
 
-    def makeConnection(self, transport):
-        protocol.Protocol.makeConnection(self, transport)
+    def __init__(self, factory):
+        self.factory = factory
 
     def connectionMade(self):
         # This table routes parsing states to handling functions
@@ -82,9 +81,6 @@ class IRPServer(protocol.Protocol):
             IRPServer.CLIENT_RANDOM: self.handleClientRandom,
             IRPServer.CLIENT_HEARTBEAT: self.handleHeartbeat
         }
-
-        from UserDatabase import _servPrivKey
-        self.signatureKey = RSA.importKey(_servPrivKey)
 
         log.msg("Connection established, sending SERVER_HELLO")
         self.sendServerHello()
@@ -127,7 +123,7 @@ class IRPServer(protocol.Protocol):
         """
         digest = SHA256.new(data)
         log.msg("Signing data. Digest is %s" % digest.hexdigest())
-        return PKCS1_v1_5.new(self.signatureKey).sign(digest)
+        return PKCS1_v1_5.new(self.factory.signatureKey).sign(digest)
 
     def constructMessage(self, data, type):
         """
@@ -321,7 +317,21 @@ class IRPServer(protocol.Protocol):
         log.msg("Successfully authenticated, starting session")
 
 class IRPServerFactory(protocol.ServerFactory):
-    protocol = IRPServer
+    """
+    Server factory for client handlers.
+
+    @ivar signatureKey: An RSA private key used for signing messages.
+    """
+    signatureKey = None
+
+    def __init__(self):
+        from UserDatabase import _servPrivKey
+        self.signatureKey = RSA.importKey(_servPrivKey)
+
+    def buildProtocol(self, addr):
+        return IRPServer(self)
+
+
 
 
 
