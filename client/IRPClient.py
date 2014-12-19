@@ -1,4 +1,5 @@
 import StringIO
+from datetime import datetime
 import struct
 from Crypto import Random
 from Crypto.Cipher import AES
@@ -11,6 +12,7 @@ from math import ceil
 from twisted.internet import protocol
 from twisted.python import log
 from shared.Certificate import Certificate
+from shared.Message import Message
 
 __author__ = 'iravid'
 
@@ -58,8 +60,8 @@ class IRPClient(protocol.Protocol):
     DIFFIE_HELLMAN_G = 2
 
     HEADER_FORMAT_STRING = "!BHH"
-    # usernameLength (H), digestLength (H), transmitSize (H), hexDigest (appended string)
-    TRANSMIT_HEADERS_FORMAT_STRING = "!HHH"
+    # digestLength (H), transmitSize (H), hexDigest (appended string)
+    TRANSMIT_HEADERS_FORMAT_STRING = "!HH"
 
     TRANSMIT_CHUNK_SIZE = 1024
 
@@ -298,14 +300,6 @@ class IRPClient(protocol.Protocol):
     def startSession(self):
         self.protocolState = IRPClient.AUTHENTICATED
         log.msg("Authenticated successfully, session started")
-
-        # File send test
-        testFile = StringIO.StringIO(Random.get_random_bytes(int(1024 * 11.5)))
-        testFileLength = int(1024 * 11.5)
-        testFileDigest = SHA256.new(testFile.getvalue()).hexdigest()
-
-        from twisted.internet import reactor
-        reactor.callLater(2, self.sendFile, "iravid", testFile, testFileLength, testFileDigest)
 
     def sendUserListRequest(self):
         msg = self.constructMessage("", IRPClient.USER_LIST_REQUEST)

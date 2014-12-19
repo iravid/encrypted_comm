@@ -37,8 +37,8 @@ class IRPServer(protocol.Protocol):
 
     # msgType (B), dataLength (H), signatureLength (H)
     HEADER_FORMAT_STRING = "!BHH"
-    # usernameLength (H), digestLength (H), transmitSize (H), username, hexDigest (appended string)
-    TRANSMIT_HEADERS_FORMAT_STRING = "!HHH"
+    # digestLength (H), transmitSize (H), username, hexDigest (appended string)
+    TRANSMIT_HEADERS_FORMAT_STRING = "!HH"
 
     TRANSMIT_CHUNK_SIZE = 1024
 
@@ -496,13 +496,13 @@ class IRPServer(protocol.Protocol):
         msg = self.constructMessage("", IRPServer.TRANSMIT_SUCCESS)
         self.transport.write(msg)
 
+        self.factory.handleReceivedMessage(self._fileInTransmit.getvalue())
+
         # Remove state variables and return to AUTHENTICATED state
         self._fileInTransmit = None
         self._transmitChunksLeft = None
         self._transmitHexDigest = None
         self.protocolState = IRPServer.AUTHENTICATED
-
-        # TODO: Transmit success callback
 
     def sendTransmitFailure(self):
         """
@@ -540,6 +540,10 @@ class IRPServerFactory(protocol.ServerFactory):
         for username in UserDatabase.getUsers():
             mailbox = MaildirMailbox(os.path.join(Configuration.MAILDIR_DIRECTORY, username))
             self.mailboxes[username] = mailbox
+
+    def handleReceivedMessage(self, msg):
+        log.msg("In handleReceivedMessage with:")
+        log.msg(msg)
 
 
 
