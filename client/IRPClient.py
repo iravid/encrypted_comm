@@ -324,12 +324,10 @@ class IRPClient(protocol.Protocol):
         assert self.protocolState == IRPClient.AUTHENTICATED
 
         buffer = self.msgData
-        usernameLength, digestLength, self._transmitChunksLeft = struct.unpack_from(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
 
+        digestLength, self._transmitChunksLeft = struct.unpack_from(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
         buffer = buffer[struct.calcsize(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING):]
-        username = buffer[:usernameLength]
 
-        buffer = buffer[usernameLength:]
         self._transmitHexDigest = buffer[:digestLength]
 
         self._fileInTransmit = StringIO.StringIO()
@@ -411,10 +409,9 @@ class IRPClient(protocol.Protocol):
         # TODO: Transmit failure callback
 
     # Methods for handling an outgoing file transmission
-    def sendFile(self, recipient, file, length, hexDigest):
+    def sendFile(self, file, length, hexDigest):
         """
         Send a file to the server.
-        :param recipient: The intended recipient of the file.
         :param file: A file-like object containing the file data.
         :param length: The length of the file.
         :param hexDigest: The SHA256 hex-digest of the file data.
@@ -422,7 +419,6 @@ class IRPClient(protocol.Protocol):
         self._fileInTransmit = file
         self._transmitSize = int(ceil(float(length) / IRPClient.TRANSMIT_CHUNK_SIZE))
         self._transmitHexDigest = hexDigest
-        self._recipient = recipient
 
         self.protocolState = IRPClient.SENDING_FILE
         self.sendFileHeaders()
@@ -430,10 +426,9 @@ class IRPClient(protocol.Protocol):
     def sendFileHeaders(self):
         """
         Send the headers message in the following format:
-        <usernameLength><hexDigestLength><transmitChunkAmount><username><hexDigest>
+        <hexDigestLength><transmitChunkAmount><hexDigest>
         """
-        data = struct.pack(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, len(self._recipient), len(self._transmitHexDigest), self._transmitSize)
-        data += self._recipient
+        data = struct.pack(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, len(self._transmitHexDigest), self._transmitSize)
         data += self._transmitHexDigest
 
         msg = self.constructMessage(data, IRPClient.TRANSMIT_HEADERS)

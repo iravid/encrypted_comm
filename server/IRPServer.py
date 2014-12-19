@@ -365,11 +365,10 @@ class IRPServer(protocol.Protocol):
     def sendFileHeaders(self):
         """
         Send the headers message in the following format:
-        <usernameLength><hexDigestLength><transmitChunkAmount><username><hexDigest>
+        <hexDigestLength><transmitChunkAmount><hexDigest>
         """
 
-        data = struct.pack(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, len(self.clientCert.username), len(self._transmitHexDigest), self._transmitSize)
-        data += self.clientCert.username
+        data = struct.pack(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, len(self._transmitHexDigest), self._transmitSize)
         data += self._transmitHexDigest
 
         msg = self.constructMessage(data, IRPServer.TRANSMIT_HEADERS)
@@ -436,12 +435,10 @@ class IRPServer(protocol.Protocol):
         assert self.protocolState == IRPServer.AUTHENTICATED
 
         buffer = self.msgData
-        usernameLength, digestLength, self._transmitChunksLeft = struct.unpack_from(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
+        digestLength, self._transmitChunksLeft = struct.unpack_from(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
 
         buffer = buffer[struct.calcsize(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING):]
-        username = buffer[:usernameLength]
 
-        buffer = buffer[usernameLength:]
         self._transmitHexDigest = buffer[:digestLength]
 
         self._fileInTransmit = StringIO.StringIO()
