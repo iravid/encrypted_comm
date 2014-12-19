@@ -494,7 +494,7 @@ class IRPServer(protocol.Protocol):
 
     def sendTransmitSuccess(self):
         """
-        Inform the server of the transmit sucess and call the received file callback.
+        Inform the client of the transmit sucess and call the received file callback.
         """
         msg = self.constructMessage("", IRPServer.TRANSMIT_SUCCESS)
         self.transport.write(msg)
@@ -509,7 +509,7 @@ class IRPServer(protocol.Protocol):
 
     def sendTransmitFailure(self):
         """
-        Inform the server of the transmit failure and call the received file errback.
+        Inform the client of the transmit failure and call the received file errback.
         """
         msg = self.constructMessage("", IRPServer.TRANSMIT_FAILURE)
         self.transport.write(msg)
