@@ -7,6 +7,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Random import random
 from Crypto.Signature import PKCS1_v1_5
 from Crypto.Util import number
+from math import ceil
 from twisted.internet import protocol
 from twisted.python import log
 from shared.Certificate import Certificate
@@ -60,6 +61,8 @@ class IRPClient(protocol.Protocol):
     # usernameLength (H), digestLength (H), transmitSize (H), hexDigest (appended string)
     TRANSMIT_HEADERS_FORMAT_STRING = "!HHH"
 
+    TRANSMIT_CHUNK_SIZE = 1024
+
     # Message types
     SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT, USER_LIST_REQUEST,\
         USER_LIST_RESPONSE, TRANSMIT_HEADERS, TRANSMIT_START, TRANSMIT_CHUNK, RECEIVED_CHUNK, TRANSMIT_SUCCESS,\
@@ -102,9 +105,12 @@ class IRPClient(protocol.Protocol):
             IRPClient.SERVER_RANDOM: self.handleServerRandom,
             IRPClient.SERVER_HEARTBEAT: self.handleHeartbeat,
             IRPClient.USER_LIST_RESPONSE: self.handleUserListResponse,
+            IRPClient.TRANSMIT_START: self.handleTransmitStart,
+            IRPClient.RECEIVED_CHUNK: self.handleReceivedChunk,
+            IRPClient.TRANSMIT_SUCCESS: self.handleTransmitSuccess,
+            IRPClient.TRANSMIT_FAILURE: self.handleTransmitFailure,
             IRPClient.TRANSMIT_HEADERS: self.handleTransmitHeaders,
-            IRPClient.TRANSMIT_CHUNK: self.handleTransmitChunk,
-
+            IRPClient.TRANSMIT_CHUNK: self.handleTransmitChunk
         }
 
         self.clientCert = Certificate.deserialize(_clientCert)
@@ -293,6 +299,14 @@ class IRPClient(protocol.Protocol):
         self.protocolState = IRPClient.AUTHENTICATED
         log.msg("Authenticated successfully, session started")
 
+        # File send test
+        testFile = StringIO.StringIO(Random.get_random_bytes(int(1024 * 11.5)))
+        testFileLength = int(1024 * 11.5)
+        testFileDigest = SHA256.new(testFile.getvalue()).hexdigest()
+
+        from twisted.internet import reactor
+        reactor.callLater(2, self.sendFile, "iravid", testFile, testFileLength, testFileDigest)
+
     def sendUserListRequest(self):
         msg = self.constructMessage("", IRPClient.USER_LIST_REQUEST)
         self.transport.write(msg)
@@ -372,6 +386,13 @@ class IRPClient(protocol.Protocol):
         """
         msg = self.constructMessage("", IRPClient.TRANSMIT_SUCCESS)
         self.transport.write(msg)
+
+        # Remove state variables and return to AUTHENTICATED state
+        self._fileInTransmit = None
+        self._transmitChunksLeft = None
+        self._transmitHexDigest = None
+        self.protocolState = IRPClient.AUTHENTICATED
+
         # TODO: Transmit success callback
 
     def sendTransmitFailure(self):
@@ -380,7 +401,96 @@ class IRPClient(protocol.Protocol):
         """
         msg = self.constructMessage("", IRPClient.TRANSMIT_FAILURE)
         self.transport.write(msg)
+
+        # Remove state variables and return to AUTHENTICATED state
+        self._fileInTransmit = None
+        self._transmitChunksLeft = None
+        self._transmitHexDigest = None
+        self.protocolState = IRPClient.AUTHENTICATED
+
         # TODO: Transmit failure callback
+
+    # Methods for handling an outgoing file transmission
+    def sendFile(self, recipient, file, length, hexDigest):
+        """
+        Send a file to the server.
+        :param recipient: The intended recipient of the file.
+        :param file: A file-like object containing the file data.
+        :param length: The length of the file.
+        :param hexDigest: The SHA256 hex-digest of the file data.
+        """
+        self._fileInTransmit = file
+        self._transmitSize = int(ceil(float(length) / IRPClient.TRANSMIT_CHUNK_SIZE))
+        self._transmitHexDigest = hexDigest
+        self._recipient = recipient
+
+        self.protocolState = IRPClient.SENDING_FILE
+        self.sendFileHeaders()
+
+    def sendFileHeaders(self):
+        """
+        Send the headers message in the following format:
+        <usernameLength><hexDigestLength><transmitChunkAmount><username><hexDigest>
+        """
+        data = struct.pack(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, len(self._recipient), len(self._transmitHexDigest), self._transmitSize)
+        data += self._recipient
+        data += self._transmitHexDigest
+
+        msg = self.constructMessage(data, IRPClient.TRANSMIT_HEADERS)
+        self.transport.write(msg)
+
+    def handleTransmitStart(self):
+        """
+        Server has indicated that we can start transmitting the file.
+        """
+        assert self.protocolState == IRPClient.SENDING_FILE
+        self.sendTransmitChunk()
+
+    def handleReceivedChunk(self):
+        """
+        Server has indicated we can send the next chunk.
+        """
+        assert self.protocolState == IRPClient.SENDING_FILE
+        self.sendTransmitChunk()
+
+    def sendTransmitChunk(self):
+        """
+        Send another TRANSMIT_CHUNK_SIZE bytes of the file.
+        """
+        chunkData = self._fileInTransmit.read(IRPClient.TRANSMIT_CHUNK_SIZE)
+
+        if chunkData:
+            msg = self.constructMessage(chunkData, IRPClient.TRANSMIT_CHUNK)
+            self.transport.write(msg)
+
+    def handleTransmitSuccess(self):
+        """
+        Server has indicated that the transfer was successful. Change state to AUTHENTICATED.
+        """
+        assert self.protocolState == IRPClient.SENDING_FILE
+        assert not self._fileInTransmit.read(IRPClient.TRANSMIT_CHUNK_SIZE)
+        log.msg("Transmit successful")
+
+        self._fileInTransmit = None
+        self._transmitSize = None
+        self._transmitHexDigest = None
+
+        self.protocolState = IRPClient.AUTHENTICATED
+
+    def handleTransmitFailure(self):
+        """
+        Client has indicated that the transfer failed. Change state to AUTHENTICATED.
+        """
+        assert self.protocolState == IRPClient.SENDING_FILE
+        assert not self._fileInTransmit.read(IRPClient.TRANSMIT_CHUNK_SIZE)
+        log.msg("Transmit failure")
+
+        self._fileInTransmit = None
+        self._transmitSize = None
+        self._transmitHexDigest = None
+
+        self.protocolState = IRPClient.AUTHENTICATED
+
 
 class IRPClientFactory(protocol.ClientFactory):
     protocol = IRPClient

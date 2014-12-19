@@ -96,7 +96,9 @@ class IRPServer(protocol.Protocol):
             IRPServer.TRANSMIT_START: self.handleTransmitStart,
             IRPServer.RECEIVED_CHUNK: self.handleReceivedChunk,
             IRPServer.TRANSMIT_SUCCESS: self.handleTransmitSuccess,
-            IRPServer.TRANSMIT_FAILURE: self.handleTransmitFailure
+            IRPServer.TRANSMIT_FAILURE: self.handleTransmitFailure,
+            IRPServer.TRANSMIT_HEADERS: self.handleTransmitHeaders,
+            IRPServer.TRANSMIT_CHUNK: self.handleTransmitChunk,
         }
 
         log.msg("Connection established, sending SERVER_HELLO")
@@ -334,14 +336,6 @@ class IRPServer(protocol.Protocol):
         self.protocolState = IRPServer.AUTHENTICATED
         log.msg("Successfully authenticated, starting session")
 
-        # File send test
-        testFile = StringIO.StringIO(Random.get_random_bytes(int(1024 * 11.5)))
-        testFileLength = int(1024 * 11.5)
-        testFileDigest = SHA256.new(testFile.getvalue()).hexdigest()
-
-        from twisted.internet import reactor
-        reactor.callLater(2, self.sendFile, testFile, testFileLength, testFileDigest)
-
     def handleUserListRequest(self):
         if self.protocolState != IRPServer.AUTHENTICATED:
             raise ProtocolException("Need to be authenticated to list users")
@@ -370,8 +364,8 @@ class IRPServer(protocol.Protocol):
 
     def sendFileHeaders(self):
         """
-        Send the headers message, containing a recipient username, the length of the digest,
-        the number of chunks to be transmitted and the digest itself.
+        Send the headers message in the following format:
+        <usernameLength><hexDigestLength><transmitChunkAmount><username><hexDigest>
         """
 
         data = struct.pack(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, len(self.clientCert.username), len(self._transmitHexDigest), self._transmitSize)
@@ -410,7 +404,13 @@ class IRPServer(protocol.Protocol):
         Client has indicated that the transfer was successful. Change state to AUTHENTICATED.
         """
         assert self.protocolState == IRPServer.SENDING_FILE
+        assert not self._fileInTransmit.read(IRPServer.TRANSMIT_CHUNK_SIZE)
         log.msg("Transmit successful")
+
+        self._fileInTransmit = None
+        self._transmitSize = None
+        self._transmitHexDigest = None
+
         self.protocolState = IRPServer.AUTHENTICATED
 
     def handleTransmitFailure(self):
@@ -418,8 +418,109 @@ class IRPServer(protocol.Protocol):
         Client has indicated that the transfer failed. Change state to AUTHENTICATED.
         """
         assert self.protocolState == IRPServer.SENDING_FILE
+        assert not self._fileInTransmit.read(IRPServer.TRANSMIT_CHUNK_SIZE)
         log.msg("Transmit failure")
+
+        self._fileInTransmit = None
+        self._transmitSize = None
+        self._transmitHexDigest = None
+
         self.protocolState = IRPServer.AUTHENTICATED
+
+    # Methods for handling an incoming file transmission
+    def handleTransmitHeaders(self):
+        """
+        Client has indicated a file transmission is about to occur and has sent the headers. Parse them out, set
+        protocol state to RECEIVING_FILE and send a response.
+        """
+        assert self.protocolState == IRPServer.AUTHENTICATED
+
+        buffer = self.msgData
+        usernameLength, digestLength, self._transmitChunksLeft = struct.unpack_from(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
+
+        buffer = buffer[struct.calcsize(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING):]
+        username = buffer[:usernameLength]
+
+        buffer = buffer[usernameLength:]
+        self._transmitHexDigest = buffer[:digestLength]
+
+        self._fileInTransmit = StringIO.StringIO()
+
+        self.protocolState = IRPServer.RECEIVING_FILE
+        self.sendTransmitStart()
+
+    def sendTransmitStart(self):
+        """
+        Indicate to client that the transmit may start.
+        """
+        msg = self.constructMessage("", IRPServer.TRANSMIT_START)
+        self.transport.write(msg)
+
+    def handleTransmitChunk(self):
+        """
+        Read a chunk. If enough chunks were read, verify the digest. If not, send a RECEIVED_CHUNK message.
+        """
+        assert self.protocolState == IRPServer.RECEIVING_FILE
+
+        if self._transmitChunksLeft <= 0:
+            raise ProtocolException("Unexpected chunk received")
+
+        self._fileInTransmit.write(self.msgData)
+        self._transmitChunksLeft -= 1
+
+        if self._transmitChunksLeft > 0:
+            self.sendReceivedChunk()
+        else:
+            self.verifyFileDigest()
+
+    def sendReceivedChunk(self):
+        """
+        Indicate to client that another chunk may be sent.
+        """
+        msg = self.constructMessage("", IRPServer.RECEIVED_CHUNK)
+        self.transport.write(msg)
+
+    def verifyFileDigest(self):
+        """
+        Compare the received file's SHA256 digest to the pretransmitted digest. If they are identical,
+        send a TRANSMIT_SUCCESS message. If not, send a TRANSMIT_FAILURE message.
+        """
+        digest = SHA256.new(self._fileInTransmit.getvalue()).hexdigest()
+
+        if digest == self._transmitHexDigest:
+            self.sendTransmitSuccess()
+        else:
+            self.sendTransmitFailure()
+
+    def sendTransmitSuccess(self):
+        """
+        Inform the server of the transmit sucess and call the received file callback.
+        """
+        msg = self.constructMessage("", IRPServer.TRANSMIT_SUCCESS)
+        self.transport.write(msg)
+
+        # Remove state variables and return to AUTHENTICATED state
+        self._fileInTransmit = None
+        self._transmitChunksLeft = None
+        self._transmitHexDigest = None
+        self.protocolState = IRPServer.AUTHENTICATED
+
+        # TODO: Transmit success callback
+
+    def sendTransmitFailure(self):
+        """
+        Inform the server of the transmit failure and call the received file errback.
+        """
+        msg = self.constructMessage("", IRPServer.TRANSMIT_FAILURE)
+        self.transport.write(msg)
+
+        # Remove state variables and return to AUTHENTICATED state
+        self._fileInTransmit = None
+        self._transmitChunksLeft = None
+        self._transmitHexDigest = None
+        self.protocolState = IRPServer.AUTHENTICATED
+
+        # TODO: Transmit failure callback
 
 class IRPServerFactory(protocol.ServerFactory):
     """
