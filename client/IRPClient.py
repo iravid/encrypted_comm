@@ -1,3 +1,4 @@
+import StringIO
 import struct
 from Crypto import Random
 from Crypto.Cipher import AES
@@ -56,13 +57,17 @@ class IRPClient(protocol.Protocol):
     DIFFIE_HELLMAN_G = 2
 
     HEADER_FORMAT_STRING = "!BHH"
+    # usernameLength (H), digestLength (H), transmitSize (H), hexDigest (appended string)
+    TRANSMIT_HEADERS_FORMAT_STRING = "!HHH"
 
     # Message types
-    SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT = range(6)
+    SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT, USER_LIST_REQUEST,\
+        USER_LIST_RESPONSE, TRANSMIT_HEADERS, TRANSMIT_START, TRANSMIT_CHUNK, RECEIVED_CHUNK, TRANSMIT_SUCCESS,\
+        TRANSMIT_FAILURE = range(14)
 
     # Protocol states
     protocolState = None
-    WAITING_HELLO, WAITING_RANDOM, WAITING_HEARTBEAT, AUTHENTICATED = range(4)
+    WAITING_HELLO, WAITING_RANDOM, WAITING_HEARTBEAT, AUTHENTICATED, SENDING_FILE, RECEIVING_FILE = range(6)
 
     # Parse states
     parseState = None
@@ -95,7 +100,11 @@ class IRPClient(protocol.Protocol):
         self.protocolDispatchTable = {
             IRPClient.SERVER_HELLO: self.handleServerHello,
             IRPClient.SERVER_RANDOM: self.handleServerRandom,
-            IRPClient.SERVER_HEARTBEAT: self.handleHeartbeat
+            IRPClient.SERVER_HEARTBEAT: self.handleHeartbeat,
+            IRPClient.USER_LIST_RESPONSE: self.handleUserListResponse,
+            IRPClient.TRANSMIT_HEADERS: self.handleTransmitHeaders,
+            IRPClient.TRANSMIT_CHUNK: self.handleTransmitChunk,
+
         }
 
         self.clientCert = Certificate.deserialize(_clientCert)
@@ -283,6 +292,95 @@ class IRPClient(protocol.Protocol):
     def startSession(self):
         self.protocolState = IRPClient.AUTHENTICATED
         log.msg("Authenticated successfully, session started")
+
+    def sendUserListRequest(self):
+        msg = self.constructMessage("", IRPClient.USER_LIST_REQUEST)
+        self.transport.write(msg)
+
+    def handleUserListResponse(self):
+        userList = self.msgData.split("\n")
+        # TODO: user list response callback
+
+    # Methods for handling an incoming file transmission
+    def handleTransmitHeaders(self):
+        """
+        Server has indicated a file transmission is about to occur and has sent the headers. Parse them out, set
+        protocol state to RECEIVING_FILE and send a response.
+        """
+        assert self.protocolState == IRPClient.AUTHENTICATED
+
+        buffer = self.msgData
+        usernameLength, digestLength, self._transmitChunksLeft = struct.unpack_from(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING, buffer)
+
+        buffer = buffer[struct.calcsize(IRPClient.TRANSMIT_HEADERS_FORMAT_STRING):]
+        username = buffer[:usernameLength]
+
+        buffer = buffer[usernameLength:]
+        self._transmitHexDigest = buffer[:digestLength]
+
+        self._fileInTransmit = StringIO.StringIO()
+
+        self.protocolState = IRPClient.RECEIVING_FILE
+        self.sendTransmitStart()
+
+    def sendTransmitStart(self):
+        """
+        Indicate to server that the transmit may start.
+        """
+        msg = self.constructMessage("", IRPClient.TRANSMIT_START)
+        self.transport.write(msg)
+
+    def handleTransmitChunk(self):
+        """
+        Read a chunk. If enough chunks were read, verify the digest. If not, send a RECEIVED_CHUNK message.
+        """
+        assert self.protocolState == IRPClient.RECEIVING_FILE
+
+        if self._transmitChunksLeft <= 0:
+            raise ProtocolException("Unexpected chunk received")
+
+        self._fileInTransmit.write(self.msgData)
+        self._transmitChunksLeft -= 1
+
+        if self._transmitChunksLeft > 0:
+            self.sendReceivedChunk()
+        else:
+            self.verifyFileDigest()
+
+    def sendReceivedChunk(self):
+        """
+        Indicate to server that another chunk may be sent.
+        """
+        msg = self.constructMessage("", IRPClient.RECEIVED_CHUNK)
+        self.transport.write(msg)
+
+    def verifyFileDigest(self):
+        """
+        Compare the received file's SHA256 digest to the pretransmitted digest. If they are identical,
+        send a TRANSMIT_SUCCESS message. If not, send a TRANSMIT_FAILURE message.
+        """
+        digest = SHA256.new(self._fileInTransmit.getvalue()).hexdigest()
+
+        if digest == self._transmitHexDigest:
+            self.sendTransmitSuccess()
+        else:
+            self.sendTransmitFailure()
+
+    def sendTransmitSuccess(self):
+        """
+        Inform the server of the transmit sucess and call the received file callback.
+        """
+        msg = self.constructMessage("", IRPClient.TRANSMIT_SUCCESS)
+        self.transport.write(msg)
+        # TODO: Transmit success callback
+
+    def sendTransmitFailure(self):
+        """
+        Inform the server of the transmit failure and call the received file errback.
+        """
+        msg = self.constructMessage("", IRPClient.TRANSMIT_FAILURE)
+        self.transport.write(msg)
+        # TODO: Transmit failure callback
 
 class IRPClientFactory(protocol.ClientFactory):
     protocol = IRPClient

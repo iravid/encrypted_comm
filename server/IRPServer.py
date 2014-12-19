@@ -1,5 +1,7 @@
+import StringIO
 import os
 from Crypto.Util import number
+from math import ceil
 from twisted.mail.maildir import MaildirMailbox
 from twisted.python import log
 from server import Configuration
@@ -33,17 +35,24 @@ class IRPServer(protocol.Protocol):
     DIFFIE_HELLMAN_P = 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF
     DIFFIE_HELLMAN_G = 2
 
+    # msgType (B), dataLength (H), signatureLength (H)
     HEADER_FORMAT_STRING = "!BHH"
+    # usernameLength (H), digestLength (H), transmitSize (H), username, hexDigest (appended string)
+    TRANSMIT_HEADERS_FORMAT_STRING = "!HHH"
+
+    TRANSMIT_CHUNK_SIZE = 1024
 
     SERVER_HEARTBEAT_MAGIC = 0xAA
     CLIENT_HEARTBEAT_MAGIC = 0xCC
 
     # Message types
-    SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT = range(6)
+    SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT, USER_LIST_REQUEST,\
+        USER_LIST_RESPONSE, TRANSMIT_HEADERS, TRANSMIT_START, TRANSMIT_CHUNK, RECEIVED_CHUNK, TRANSMIT_SUCCESS,\
+        TRANSMIT_FAILURE = range(14)
 
     # Protocol states
     protocolState = None
-    WAITING_HELLO, WAITING_RANDOM, WAITING_HEARTBEAT, AUTHENTICATED = range(4)
+    WAITING_HELLO, WAITING_RANDOM, WAITING_HEARTBEAT, AUTHENTICATED, SENDING_FILE, RECEIVING_FILE = range(6)
 
     # Parsing state
     parseState = None
@@ -82,7 +91,12 @@ class IRPServer(protocol.Protocol):
         self.protocolDispatchTable = {
             IRPServer.CLIENT_HELLO: self.handleClientHello,
             IRPServer.CLIENT_RANDOM: self.handleClientRandom,
-            IRPServer.CLIENT_HEARTBEAT: self.handleHeartbeat
+            IRPServer.CLIENT_HEARTBEAT: self.handleHeartbeat,
+            IRPServer.USER_LIST_REQUEST: self.handleUserListRequest,
+            IRPServer.TRANSMIT_START: self.handleTransmitStart,
+            IRPServer.RECEIVED_CHUNK: self.handleReceivedChunk,
+            IRPServer.TRANSMIT_SUCCESS: self.handleTransmitSuccess,
+            IRPServer.TRANSMIT_FAILURE: self.handleTransmitFailure
         }
 
         log.msg("Connection established, sending SERVER_HELLO")
@@ -177,6 +191,7 @@ class IRPServer(protocol.Protocol):
         if transmittedCert.username != userCert.username or transmittedCert.publicKey != userCert.publicKey:
             raise ProtocolException("Username or public key not matching the ones stored in the database")
 
+        self.clientCert = transmittedCert
         self.clientSignatureKey = RSA.importKey(transmittedCert.publicKey)
 
         # Dirty hack - re-encode in base64 to verify the signature
@@ -318,6 +333,93 @@ class IRPServer(protocol.Protocol):
     def startSession(self):
         self.protocolState = IRPServer.AUTHENTICATED
         log.msg("Successfully authenticated, starting session")
+
+        # File send test
+        testFile = StringIO.StringIO(Random.get_random_bytes(int(1024 * 11.5)))
+        testFileLength = int(1024 * 11.5)
+        testFileDigest = SHA256.new(testFile.getvalue()).hexdigest()
+
+        from twisted.internet import reactor
+        reactor.callLater(2, self.sendFile, testFile, testFileLength, testFileDigest)
+
+    def handleUserListRequest(self):
+        if self.protocolState != IRPServer.AUTHENTICATED:
+            raise ProtocolException("Need to be authenticated to list users")
+        self.sendUserListResponse()
+
+    def sendUserListResponse(self):
+        userList = '\n'.join(self.factory.mailboxes.keys())
+        msg = self.constructMessage(userList, IRPServer.USER_LIST_RESPONSE)
+        self.transport.write(msg)
+
+    def sendFile(self, file, length, hexDigest):
+        """
+        Send a file to the client.
+        @var file: File-like object (can be read from in chunks) containing data to be sent
+        @var length: Length of the file in bytes
+        @var hexDigest: SHA256 hex-digest (in string form) of the file
+        """
+        self._fileInTransmit = file
+        self._transmitSize = int(ceil(float(length) / IRPServer.TRANSMIT_CHUNK_SIZE))
+        self._transmitHexDigest = hexDigest
+
+        log.msg("Sending file; chunk size is %d, digest is %s" % (self._transmitSize, self._transmitHexDigest))
+
+        self.protocolState = IRPServer.SENDING_FILE
+        self.sendFileHeaders()
+
+    def sendFileHeaders(self):
+        """
+        Send the headers message, containing a recipient username, the length of the digest,
+        the number of chunks to be transmitted and the digest itself.
+        """
+
+        data = struct.pack(IRPServer.TRANSMIT_HEADERS_FORMAT_STRING, len(self.clientCert.username), len(self._transmitHexDigest), self._transmitSize)
+        data += self.clientCert.username
+        data += self._transmitHexDigest
+
+        msg = self.constructMessage(data, IRPServer.TRANSMIT_HEADERS)
+        self.transport.write(msg)
+
+    def handleTransmitStart(self):
+        """
+        Client has indicated that we can start transmitting the file.
+        """
+        assert self.protocolState == IRPServer.SENDING_FILE
+        self.sendTransmitChunk()
+
+    def handleReceivedChunk(self):
+        """
+        Client has indicated we can send the next chunk.
+        """
+        assert self.protocolState == IRPServer.SENDING_FILE
+        self.sendTransmitChunk()
+
+    def sendTransmitChunk(self):
+        """
+        Send another TRANSMIT_CHUNK_SIZE bytes of the file.
+        """
+        chunkData = self._fileInTransmit.read(IRPServer.TRANSMIT_CHUNK_SIZE)
+
+        if chunkData:
+            msg = self.constructMessage(chunkData, IRPServer.TRANSMIT_CHUNK)
+            self.transport.write(msg)
+
+    def handleTransmitSuccess(self):
+        """
+        Client has indicated that the transfer was successful. Change state to AUTHENTICATED.
+        """
+        assert self.protocolState == IRPServer.SENDING_FILE
+        log.msg("Transmit successful")
+        self.protocolState = IRPServer.AUTHENTICATED
+
+    def handleTransmitFailure(self):
+        """
+        Client has indicated that the transfer failed. Change state to AUTHENTICATED.
+        """
+        assert self.protocolState == IRPServer.SENDING_FILE
+        log.msg("Transmit failure")
+        self.protocolState = IRPServer.AUTHENTICATED
 
 class IRPServerFactory(protocol.ServerFactory):
     """
