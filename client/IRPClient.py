@@ -9,7 +9,8 @@ from Crypto.Random import random
 from Crypto.Signature import PKCS1_v1_5
 from Crypto.Util import number
 from math import ceil
-from twisted.internet import protocol
+from twisted.internet import protocol, defer
+from twisted.internet.defer import Deferred
 from twisted.python import log
 from shared.Certificate import Certificate
 from shared.Message import Message
@@ -68,7 +69,7 @@ class IRPClient(protocol.Protocol):
     # Message types
     SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT, USER_LIST_REQUEST,\
         USER_LIST_RESPONSE, TRANSMIT_HEADERS, TRANSMIT_START, TRANSMIT_CHUNK, RECEIVED_CHUNK, TRANSMIT_SUCCESS,\
-        TRANSMIT_FAILURE = range(14)
+        TRANSMIT_FAILURE, MESSAGE_LIST_REQUEST, MESSAGE_LIST_RESPONSE, MESSAGE_RETRIEVE_REQUEST = range(17)
 
     # Protocol states
     protocolState = None
@@ -84,16 +85,9 @@ class IRPClient(protocol.Protocol):
     # Data remaining to be parsed
     remainingData = b""
 
-    # Crypto stuff
-    serverSignatureKey = RSA.importKey(_servPubKey)
-    signatureKey = None
-
     # Server key is preloaded, so signatures can be verified from the start
     verifySignatures = True
     encryptMessages = False
-
-    def makeConnection(self, transport):
-        protocol.Protocol.makeConnection(self, transport)
 
     def connectionMade(self):
         self.messageDispatchTable = {
@@ -112,11 +106,15 @@ class IRPClient(protocol.Protocol):
             IRPClient.TRANSMIT_SUCCESS: self.handleTransmitSuccess,
             IRPClient.TRANSMIT_FAILURE: self.handleTransmitFailure,
             IRPClient.TRANSMIT_HEADERS: self.handleTransmitHeaders,
-            IRPClient.TRANSMIT_CHUNK: self.handleTransmitChunk
+            IRPClient.TRANSMIT_CHUNK: self.handleTransmitChunk,
+            IRPClient.MESSAGE_LIST_RESPONSE: self.handleMessageListResponse
         }
 
-        self.clientCert = Certificate.deserialize(_clientCert)
-        self.signatureKey = RSA.importKey(_clientPrivKey)
+        self.factory.clientConnectionMade(self)
+
+        self.clientCert = self.factory.clientCert
+        self.signatureKey = self.factory.signatureKey
+        self.serverSignatureKey = self.factory.serverSignatureKey
         self.protocolState = IRPClient.WAITING_HELLO
 
         log.msg("Connection established, waiting for SERVER_HELLO")
@@ -243,10 +241,14 @@ class IRPClient(protocol.Protocol):
         self.sendClientHello()
 
     def sendClientHello(self):
-        msg = self.constructMessage(self.clientCert.serialize(), IRPClient.CLIENT_HELLO)
+        # Format: <otp(I)><certificate>
+        data = struct.pack("!I", self.factory.otpValue)
+        data += self.clientCert.serialize()
+
+        msg = self.constructMessage(data, IRPClient.CLIENT_HELLO)
         self.transport.write(msg)
 
-        log.msg("Sent CLIENT_HELLO")
+        log.msg("Sent CLIENT_HELLO with OTP %d" % self.factory.otpValue)
 
         self.protocolState = IRPClient.WAITING_RANDOM
 
@@ -300,14 +302,18 @@ class IRPClient(protocol.Protocol):
     def startSession(self):
         self.protocolState = IRPClient.AUTHENTICATED
         log.msg("Authenticated successfully, session started")
+        self.factory.clientConnectionAuthenticated()
 
     def sendUserListRequest(self):
         msg = self.constructMessage("", IRPClient.USER_LIST_REQUEST)
         self.transport.write(msg)
 
+        self.nextDeferred = Deferred()
+        return self.nextDeferred
+
     def handleUserListResponse(self):
         userList = self.msgData.split("\n")
-        # TODO: user list response callback
+        self.nextDeferred.callback(userList)
 
     # Methods for handling an incoming file transmission
     def handleTransmitHeaders(self):
@@ -379,13 +385,13 @@ class IRPClient(protocol.Protocol):
         msg = self.constructMessage("", IRPClient.TRANSMIT_SUCCESS)
         self.transport.write(msg)
 
+        self.nextDeferred.callback(self._fileInTransmit.getvalue())
+
         # Remove state variables and return to AUTHENTICATED state
         self._fileInTransmit = None
         self._transmitChunksLeft = None
         self._transmitHexDigest = None
         self.protocolState = IRPClient.AUTHENTICATED
-
-        # TODO: Transmit success callback
 
     def sendTransmitFailure(self):
         """
@@ -394,13 +400,13 @@ class IRPClient(protocol.Protocol):
         msg = self.constructMessage("", IRPClient.TRANSMIT_FAILURE)
         self.transport.write(msg)
 
+        self.nextDeferred.errback(False)
+
         # Remove state variables and return to AUTHENTICATED state
         self._fileInTransmit = None
         self._transmitChunksLeft = None
         self._transmitHexDigest = None
         self.protocolState = IRPClient.AUTHENTICATED
-
-        # TODO: Transmit failure callback
 
     # Methods for handling an outgoing file transmission
     def sendFile(self, file, length, hexDigest):
@@ -416,6 +422,9 @@ class IRPClient(protocol.Protocol):
 
         self.protocolState = IRPClient.SENDING_FILE
         self.sendFileHeaders()
+
+        self.nextDeferred = Deferred()
+        return self.nextDeferred
 
     def sendFileHeaders(self):
         """
@@ -466,6 +475,8 @@ class IRPClient(protocol.Protocol):
 
         self.protocolState = IRPClient.AUTHENTICATED
 
+        self.nextDeferred.callback(True)
+
     def handleTransmitFailure(self):
         """
         Client has indicated that the transfer failed. Change state to AUTHENTICATED.
@@ -480,6 +491,130 @@ class IRPClient(protocol.Protocol):
 
         self.protocolState = IRPClient.AUTHENTICATED
 
+        self.nextDeferred.errback(False)
+
+    def sendMessageListRequest(self):
+        """
+        Request the list of messages currently in the mailbox from the server.
+        """
+        msg = self.constructMessage("", IRPClient.MESSAGE_LIST_REQUEST)
+        self.transport.write(msg)
+
+        self.nextDeferred = Deferred()
+        return self.nextDeferred
+
+
+    def handleMessageListResponse(self):
+        """
+        Handle the list of message IDs and sizes from the server.
+        """
+
+        msgSizes = self.msgData.split("\n") if self.msgData else None
+        self.nextDeferred.callback(msgSizes)
+
+    def sendMessageRetrieveRequest(self, msgId):
+        """
+        Request a specific message from the server. The response is handled by the incoming file flow.
+        :param msgId: The index of the requested message
+        """
+        log.msg("Retrieving message with id %d" % msgId)
+
+        data = struct.pack("!H", msgId)
+        msg = self.constructMessage(data, IRPClient.MESSAGE_RETRIEVE_REQUEST)
+        self.transport.write(msg)
+
+        self.nextDeferred = Deferred()
+        return self.nextDeferred
 
 class IRPClientFactory(protocol.ClientFactory):
-    protocol = IRPClient
+    def __init__(self, clientCert, clientPrivKey, serverSignatureKey=_servPubKey):
+        self.ready = False
+        self.clientCert = clientCert
+        self.signatureKey = clientPrivKey
+        self.serverSignatureKey = RSA.importKey(serverSignatureKey)
+
+    def buildProtocol(self, addr):
+        client = IRPClient()
+        client.factory = self
+        self.client = client
+
+        return client
+
+    def clientConnectionMade(self, p):
+        pass
+
+    def clientConnectionAuthenticated(self):
+        self.ready = True
+
+    def responseReceived(self, result):
+        """
+        Generic callback to set _ready to True once a response has been received.
+        """
+        self.ready = True
+        return result
+
+    def listUsers(self):
+        """
+        Request a user list from the server.
+        :return: A Deferred which will fire with a user list.
+        """
+        if not self.ready:
+            log.err("Action called when not ready")
+            return defer.fail()
+
+        self.ready = False
+        d = self.client.sendUserListRequest()
+        d.addCallback(self.responseReceived)
+
+        return d
+
+    def listMessages(self):
+        """
+        Request a message list from the server.
+        :return: A Deferred which will fire with a list of message sizes.
+        """
+        if not self.ready:
+            log.err("Action called when not ready")
+            return defer.fail()
+
+        self.ready = False
+        d = self.client.sendMessageListRequest()
+        d.addCallback(self.responseReceived)
+
+        return d
+
+    def sendMessage(self, msgData, length, hexDigest):
+        """
+        Send a message to the server.
+        :param msgData: A file-like object with the data.
+        :param length: Length of the data in bytes
+        :param hexDigest: SHA256 hex-digest of the data
+        :return: A Deferred which will fire when the message has been sent.
+        """
+        if not self.ready:
+            log.err("Action called when not ready")
+            return defer.fail()
+
+        self.ready = False
+        d = self.client.sendFile(msgData, length, hexDigest)
+        d.addCallback(self.responseReceived)
+
+        return d
+
+    def retrieveMessage(self, msgId):
+        """
+        Retrieve a message from the server.
+        :param msgId: ID of the desired message.
+        :return: A Deferred which will fire with a file-like object containing the message data.
+        """
+        if not self.ready:
+            log.err("Action called when not ready")
+            return defer.fail()
+
+        log.msg("In factory.retrieveMessage with %d" % msgId)
+
+        self.ready = False
+        d = self.client.sendMessageRetrieveRequest(msgId)
+        d.addCallback(self.responseReceived)
+
+        return d

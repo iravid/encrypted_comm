@@ -36,10 +36,12 @@ class Message(object):
 
     @staticmethod
     def deserialize(data):
-        author = data.readline().split(": ")[1]
-        recipients = data.readline().split(": ")[1].split(", ")
-        timestamp = datetime.strptime(data.readline().split(": ")[1], Message.TIMESTAMP_FORMAT)
-        subject = data.readline().split(": ")[1]
+        data = StringIO.StringIO(data)
+
+        author = data.readline().split(": ")[1].strip()
+        recipients = [recipient.strip() for recipient in data.readline().split(": ")[1].split(", ")]
+        timestamp = datetime.strptime(data.readline().split(": ")[1].strip(), Message.TIMESTAMP_FORMAT)
+        subject = data.readline().split(": ")[1].strip()
         content = data.read()
 
         return Message(author, recipients, timestamp, subject, content)

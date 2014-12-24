@@ -2,9 +2,11 @@ import StringIO
 import os
 from Crypto.Util import number
 from math import ceil
+import pyotp
 from twisted.mail.maildir import MaildirMailbox
 from twisted.python import log
 from server import Configuration
+from shared.Message import Message
 
 __author__ = 'iravid'
 
@@ -48,7 +50,7 @@ class IRPServer(protocol.Protocol):
     # Message types
     SERVER_HELLO, SERVER_RANDOM, CLIENT_HELLO, CLIENT_RANDOM, SERVER_HEARTBEAT, CLIENT_HEARTBEAT, USER_LIST_REQUEST,\
         USER_LIST_RESPONSE, TRANSMIT_HEADERS, TRANSMIT_START, TRANSMIT_CHUNK, RECEIVED_CHUNK, TRANSMIT_SUCCESS,\
-        TRANSMIT_FAILURE = range(14)
+        TRANSMIT_FAILURE, MESSAGE_LIST_REQUEST, MESSAGE_LIST_RESPONSE, MESSAGE_RETRIEVE_REQUEST = range(17)
 
     # Protocol states
     protocolState = None
@@ -99,6 +101,8 @@ class IRPServer(protocol.Protocol):
             IRPServer.TRANSMIT_FAILURE: self.handleTransmitFailure,
             IRPServer.TRANSMIT_HEADERS: self.handleTransmitHeaders,
             IRPServer.TRANSMIT_CHUNK: self.handleTransmitChunk,
+            IRPServer.MESSAGE_LIST_REQUEST: self.handleMessageListRequest,
+            IRPServer.MESSAGE_RETRIEVE_REQUEST: self.handleMessageRetrieveRequest
         }
 
         log.msg("Connection established, sending SERVER_HELLO")
@@ -187,12 +191,19 @@ class IRPServer(protocol.Protocol):
         if self.protocolState != IRPServer.WAITING_HELLO:
             raise ProtocolException("Unexpected CLIENT_HELLO received")
 
-        transmittedCert = Certificate.deserialize(self.msgData)
+        # Parse out the OTP value
+        otpSize = struct.calcsize("!I")
+        otpValue, = struct.unpack_from("!I", self.msgData)
+
+        # Parse out the certificate
+        transmittedCert = Certificate.deserialize(self.msgData[otpSize:])
         userCert = UserDatabase.getByUserId(transmittedCert.userId)
 
+        # Compare certificate values
         if transmittedCert.username != userCert.username or transmittedCert.publicKey != userCert.publicKey:
             raise ProtocolException("Username or public key not matching the ones stored in the database")
 
+        # Import the signature key
         self.clientCert = transmittedCert
         self.clientSignatureKey = RSA.importKey(transmittedCert.publicKey)
 
@@ -200,6 +211,15 @@ class IRPServer(protocol.Protocol):
         self.msgData = self.msgData.encode("base64")
         self.verifySignature()
         self.verifySignatures = True
+
+        # Verify the OTP value
+        otpSecret = UserDatabase.getOtpSecret(self.clientCert)
+        otpChecker = pyotp.TOTP(otpSecret)
+        if not otpChecker.verify(otpValue):
+            log.err("Got bad OTP value: %d" % otpValue)
+            log.err("Should have been: %d" % otpChecker.now())
+            self.transport.loseConnection()
+            return
 
         log.msg("Got CLIENT_HELLO, sending SERVER_RANDOM")
 
@@ -519,6 +539,41 @@ class IRPServer(protocol.Protocol):
 
         # TODO: Transmit failure callback
 
+    def handleMessageListRequest(self):
+        """
+        The client indicates it wants us to send the message list.
+        """
+        assert self.protocolState == IRPServer.AUTHENTICATED
+        log.msg("Client asked for message list")
+        self.sendMessageListResponse()
+
+    def sendMessageListResponse(self):
+        """
+        Send the list of message sizes to the client.
+        """
+        msgSizesList = self.factory.mailboxes[self.clientCert.username].listMessages()
+
+        # Convert to all entries to strings and concatenate with newlines
+        msgSizesList = '\n'.join([str(entry) for entry in msgSizesList])
+
+        log.msg("Sending message list of %s" % self.clientCert.username)
+        msg = self.constructMessage(msgSizesList, IRPServer.MESSAGE_LIST_RESPONSE)
+        self.transport.write(msg)
+
+    def handleMessageRetrieveRequest(self):
+        """
+        The client requests a specific message to be sent. Retrieve it from his mailbox
+        and send it over.
+        """
+        msgId, = struct.unpack("!H", self.msgData)
+
+        mailMsgFile = self.factory.mailboxes[self.clientCert.username].getMessage(msgId)
+        mailMsgData = mailMsgFile.read()
+        mailMsgLength = len(mailMsgData)
+        mailMsgDigest = SHA256.new(mailMsgData).hexdigest()
+
+        self.sendFile(StringIO.StringIO(mailMsgData), mailMsgLength, mailMsgDigest)
+
 class IRPServerFactory(protocol.ServerFactory):
     """
     Server factory for client handlers.
@@ -532,18 +587,26 @@ class IRPServerFactory(protocol.ServerFactory):
     def __init__(self):
         from UserDatabase import _servPrivKey
         self.signatureKey = RSA.importKey(_servPrivKey)
+        self.initializeMailboxes()
 
     def buildProtocol(self, addr):
         return IRPServer(self)
 
     def initializeMailboxes(self):
-        for username in UserDatabase.getUsers():
+        for userId in UserDatabase.getUsers():
+            username = UserDatabase.getByUserId(userId).username
             mailbox = MaildirMailbox(os.path.join(Configuration.MAILDIR_DIRECTORY, username))
             self.mailboxes[username] = mailbox
 
     def handleReceivedMessage(self, msg):
         log.msg("In handleReceivedMessage with:")
         log.msg(msg)
+
+        deserializedMsg = Message.deserialize(msg)
+        for recipient in deserializedMsg.recipients:
+            self.mailboxes[recipient].appendMessage(msg)
+
+
 
 
 
